@@ -8,7 +8,6 @@
     <ClCompile Include="dma.cpp" />
     <ClCompile Include="gpu.cpp" />
     <ClCompile Include="gpu_hw_opengl.cpp" />
-    <ClCompile Include="gpu_hw.cpp" />
     <ClCompile Include="host_interface.cpp" />
     <ClCompile Include="interrupt_controller.cpp" />
     <ClCompile Include="cdrom.cpp" />
@@ -46,6 +45,8 @@
     <ClCompile Include="resources.cpp" />
     <ClCompile Include="host_interface_progress_callback.cpp" />
     <ClCompile Include="pgxp.cpp" />
+    <ClCompile Include="gpu_backend.cpp" />
+    <ClCompile Include="gpu_hw.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="types.h" />
@@ -58,7 +59,6 @@
     <ClInclude Include="dma.h" />
     <ClInclude Include="gpu.h" />
     <ClInclude Include="gpu_hw_opengl.h" />
-    <ClInclude Include="gpu_hw.h" />
     <ClInclude Include="host_interface.h" />
     <ClInclude Include="interrupt_controller.h" />
     <ClInclude Include="cdrom.h" />
@@ -95,5 +95,8 @@
     <ClInclude Include="gte_types.h" />
     <ClInclude Include="pgxp.h" />
     <ClInclude Include="cpu_core_private.h" />
+    <ClInclude Include="gpu_backend.h" />
+    <ClInclude Include="gpu_hw.h" />
+    <ClInclude Include="gpu_types.h" />
   </ItemGroup>
 </Project>

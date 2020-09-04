@@ -13,6 +13,7 @@
 #include "cpu_core.h"
 #include "dma.h"
 #include "gpu.h"
+#include "gpu_backend.h"
 #include "gte.h"
 #include "host_display.h"
 #include "host_interface.h"
@@ -26,10 +27,13 @@
 #include "sio.h"
 #include "spu.h"
 #include "timers.h"
-#include <cstdio>
 #include <cctype>
+#include <condition_variable>
+#include <cstdio>
 #include <fstream>
 #include <limits>
+#include <mutex>
+#include <thread>
 Log_SetChannel(System);
 
 #ifdef WIN32
@@ -63,7 +67,6 @@ static std::unique_ptr<CDImage> OpenCDImage(const char* path, bool force_preload
 
 static bool DoLoadState(ByteStream* stream, bool force_software_renderer);
 static bool DoState(StateWrapper& sw);
-static bool CreateGPU(GPURenderer renderer);
 
 static bool Initialize(bool force_software_renderer);
 
@@ -98,6 +101,17 @@ static u32 s_last_internal_frame_number = 0;
 static u32 s_last_global_tick_counter = 0;
 static Common::Timer s_fps_timer;
 static Common::Timer s_frame_timer;
+
+static float s_average_cpu_frame_time_accumulator = 0.0f;
+static float s_worst_cpu_frame_time_accumulator = 0.0f;
+static float s_worst_cpu_frame_time = 0.0f;
+static float s_average_cpu_frame_time = 0.0f;
+static Common::Timer s_cpu_frame_timer;
+
+static void StartCPUThread();
+static void WakeCPUThread();
+static void WaitForCPUThread();
+static void StopCPUThread();
 
 // Playlist of disc images.
 static std::vector<std::string> s_media_playlist;
@@ -155,12 +169,6 @@ u32 GetInternalFrameNumber()
   return s_internal_frame_number;
 }
 
-void FrameDone()
-{
-  s_frame_number++;
-  CPU::g_state.frame_done = true;
-}
-
 void IncrementInternalFrameNumber()
 {
   s_internal_frame_number++;
@@ -196,9 +204,17 @@ float GetAverageFrameTime()
 {
   return s_average_frame_time;
 }
+float GetAverageCPUFrameTime()
+{
+  return s_average_cpu_frame_time;
+}
 float GetWorstFrameTime()
 {
   return s_worst_frame_time;
+}
+float GetWorstCPUFrameTime()
+{
+  return s_worst_cpu_frame_time;
 }
 float GetThrottleFrequency()
 {
@@ -471,22 +487,22 @@ std::optional<DiscRegion> GetRegionForPath(const char* image_path)
 
 bool RecreateGPU(GPURenderer renderer)
 {
-  g_gpu->RestoreGraphicsAPIState();
+  g_gpu_backend->RestoreGraphicsAPIState();
 
   // save current state
   std::unique_ptr<ByteStream> state_stream = ByteStream_CreateGrowableMemoryStream();
   StateWrapper sw(state_stream.get(), StateWrapper::Mode::Write);
-  const bool state_valid = g_gpu->DoState(sw) && TimingEvents::DoState(sw);
+  const bool state_valid = g_gpu_backend->DoState(sw);
   if (!state_valid)
     Log_ErrorPrintf("Failed to save old GPU state when switching renderers");
 
-  g_gpu->ResetGraphicsAPIState();
+  g_gpu_backend->ResetGraphicsAPIState();
+  g_gpu_backend.reset();
 
   // create new renderer
-  g_gpu.reset();
-  if (!CreateGPU(renderer))
+  if (!GPUBackend::Create(renderer))
   {
-    Panic("Failed to recreate GPU");
+    Panic("Failed to recreate GPU backend");
     return false;
   }
 
@@ -494,10 +510,9 @@ bool RecreateGPU(GPURenderer renderer)
   {
     state_stream->SeekAbsolute(0);
     sw.SetMode(StateWrapper::Mode::Read);
-    g_gpu->RestoreGraphicsAPIState();
-    g_gpu->DoState(sw);
-    TimingEvents::DoState(sw);
-    g_gpu->ResetGraphicsAPIState();
+    g_gpu_backend->RestoreGraphicsAPIState();
+    g_gpu_backend->DoState(sw);
+    g_gpu_backend->ResetGraphicsAPIState();
   }
 
   return true;
@@ -528,6 +543,7 @@ bool Boot(const SystemBootParameters& params)
   Assert(s_media_playlist.empty());
   s_state = State::Starting;
   s_region = g_settings.region;
+  // g_settings.cpu_thread = false;
 
   if (params.state_stream)
   {
@@ -707,15 +723,16 @@ bool Initialize(bool force_software_renderer)
   s_fps_timer.Reset();
   s_frame_timer.Reset();
 
+  if (!GPUBackend::Create(force_software_renderer ? GPURenderer::Software : g_settings.gpu_renderer))
+    return false;
+
   TimingEvents::Initialize();
 
   CPU::Initialize();
   CPU::CodeCache::Initialize(g_settings.cpu_execution_mode == CPUExecutionMode::Recompiler);
   Bus::Initialize();
 
-  if (!CreateGPU(force_software_renderer ? GPURenderer::Software : g_settings.gpu_renderer))
-    return false;
-
+  g_gpu.Initialize();
   g_dma.Initialize();
 
   g_interrupt_controller.Initialize();
@@ -728,6 +745,10 @@ bool Initialize(bool force_software_renderer)
   g_sio.Initialize();
 
   UpdateThrottlePeriod();
+
+  if (g_settings.cpu_thread)
+    StartCPUThread();
+
   return true;
 }
 
@@ -736,13 +757,19 @@ void Shutdown()
   if (s_state == State::Shutdown)
     return;
 
+  s_state = State::Stopping;
+
+  if (g_settings.cpu_thread)
+    StopCPUThread();
+
   g_sio.Shutdown();
   g_mdec.Shutdown();
   g_spu.Shutdown();
   g_timers.Shutdown();
   g_pad.Shutdown();
   g_cdrom.Shutdown();
-  g_gpu.reset();
+  g_gpu_backend.reset();
+  g_gpu.Shutdown();
   g_interrupt_controller.Shutdown();
   g_dma.Shutdown();
   CPU::CodeCache::Shutdown();
@@ -755,44 +782,6 @@ void Shutdown()
   s_media_playlist.clear();
   s_media_playlist_filename.clear();
   s_state = State::Shutdown;
-}
-
-bool CreateGPU(GPURenderer renderer)
-{
-  switch (renderer)
-  {
-    case GPURenderer::HardwareOpenGL:
-      g_gpu = GPU::CreateHardwareOpenGLRenderer();
-      break;
-
-    case GPURenderer::HardwareVulkan:
-      g_gpu = GPU::CreateHardwareVulkanRenderer();
-      break;
-
-#ifdef WIN32
-    case GPURenderer::HardwareD3D11:
-      g_gpu = GPU::CreateHardwareD3D11Renderer();
-      break;
-#endif
-
-    case GPURenderer::Software:
-    default:
-      g_gpu = GPU::CreateSoftwareRenderer();
-      break;
-  }
-
-  if (!g_gpu || !g_gpu->Initialize(g_host_interface->GetDisplay()))
-  {
-    Log_ErrorPrintf("Failed to initialize GPU, falling back to software");
-    g_gpu.reset();
-    g_gpu = GPU::CreateSoftwareRenderer();
-    if (!g_gpu->Initialize(g_host_interface->GetDisplay()))
-      return false;
-  }
-
-  // we put this here rather than in Initialize() because of the virtual calls
-  g_gpu->Reset();
-  return true;
 }
 
 bool DoState(StateWrapper& sw)
@@ -819,10 +808,13 @@ bool DoState(StateWrapper& sw)
   if (!sw.DoMarker("InterruptController") || !g_interrupt_controller.DoState(sw))
     return false;
 
-  g_gpu->RestoreGraphicsAPIState();
-  const bool gpu_result = sw.DoMarker("GPU") && g_gpu->DoState(sw);
-  g_gpu->ResetGraphicsAPIState();
+  g_gpu_backend->RestoreGraphicsAPIState();
+  const bool gpu_result = sw.DoMarker("GPUBackend") && g_gpu_backend->DoState(sw);
+  g_gpu_backend->ResetGraphicsAPIState();
   if (!gpu_result)
+    return false;
+
+  if (!sw.DoMarker("GPU") || !g_gpu.DoState(sw))
     return false;
 
   if (!sw.DoMarker("CDROM") || !g_cdrom.DoState(sw))
@@ -854,14 +846,14 @@ void Reset()
   if (IsShutdown())
     return;
 
-  g_gpu->RestoreGraphicsAPIState();
+  g_gpu_backend->RestoreGraphicsAPIState();
 
   CPU::Reset();
   CPU::CodeCache::Flush();
   Bus::Reset();
   g_dma.Reset();
   g_interrupt_controller.Reset();
-  g_gpu->Reset();
+  g_gpu.Reset();
   g_cdrom.Reset();
   g_pad.Reset();
   g_timers.Reset();
@@ -873,7 +865,7 @@ void Reset()
   TimingEvents::Reset();
   ResetPerformanceCounters();
 
-  g_gpu->ResetGraphicsAPIState();
+  g_gpu_backend->ResetGraphicsAPIState();
 }
 
 bool LoadState(ByteStream* state)
@@ -1053,12 +1045,12 @@ bool SaveState(ByteStream* state, u32 screenshot_size /* = 128 */)
   {
     header.offset_to_data = static_cast<u32>(state->GetPosition());
 
-    g_gpu->RestoreGraphicsAPIState();
+    g_gpu_backend->RestoreGraphicsAPIState();
 
     StateWrapper sw(state, StateWrapper::Mode::Write);
     const bool result = DoState(sw);
 
-    g_gpu->ResetGraphicsAPIState();
+    g_gpu_backend->ResetGraphicsAPIState();
 
     if (!result)
       return false;
@@ -1078,12 +1070,14 @@ bool SaveState(ByteStream* state, u32 screenshot_size /* = 128 */)
   return true;
 }
 
-void RunFrame()
+static std::thread s_cpu_thread;
+static std::atomic_bool s_cpu_thread_running{false};
+static std::atomic_bool s_cpu_thread_sleeping{false};
+static std::mutex s_cpu_thread_wake_mutex;
+static std::condition_variable s_cpu_thread_wake_cv;
+
+static void ExecuteCPUFrame()
 {
-  s_frame_timer.Reset();
-
-  g_gpu->RestoreGraphicsAPIState();
-
   switch (g_settings.cpu_execution_mode)
   {
     case CPUExecutionMode::Recompiler:
@@ -1106,8 +1100,97 @@ void RunFrame()
 
   // Generate any pending samples from the SPU before sleeping, this way we reduce the chances of underruns.
   g_spu.GeneratePendingSamples();
+}
 
-  g_gpu->ResetGraphicsAPIState();
+static void CPUThreadFunction()
+{
+  for (;;)
+  {
+    {
+      std::unique_lock<std::mutex> lock(s_cpu_thread_wake_mutex);
+      s_cpu_thread_sleeping.store(true);
+      s_cpu_thread_wake_cv.wait(lock, []() { return !CPU::g_state.frame_done || s_state == State::Stopping; });
+      s_cpu_thread_sleeping.store(false);
+
+      if (s_state == State::Stopping)
+        break;
+    }
+
+    s_cpu_frame_timer.Reset();
+
+    ExecuteCPUFrame();
+
+    {
+      const float frame_time = static_cast<float>(s_frame_timer.GetTimeMilliseconds());
+      s_average_cpu_frame_time_accumulator += frame_time;
+      s_worst_cpu_frame_time_accumulator = std::max(s_worst_cpu_frame_time_accumulator, frame_time);
+    }
+  }
+
+  s_cpu_thread_running.store(false);
+}
+
+void StartCPUThread()
+{
+  Assert(!s_cpu_thread.joinable() && !s_cpu_thread_running.load());
+  s_cpu_thread_running.store(true);
+  s_cpu_thread = std::thread(CPUThreadFunction);
+}
+
+void StopCPUThread()
+{
+  Assert(s_state == State::Stopping);
+  while (s_cpu_thread_running.load())
+  {
+    WakeCPUThread();
+    g_gpu_backend->ProcessGPUCommands();
+  }
+
+  if (s_cpu_thread.joinable())
+    s_cpu_thread.join();
+}
+
+void WakeCPUThread()
+{
+  std::unique_lock<std::mutex> lock(s_cpu_thread_wake_mutex);
+  if (!s_cpu_thread_sleeping.load())
+    return;
+
+  CPU::g_state.frame_done = false;
+  s_cpu_thread_wake_cv.notify_one();
+}
+
+void WaitForCPUThread()
+{
+  while (!s_cpu_thread_sleeping.load())
+    ;
+}
+
+void RunFrame()
+{
+  s_frame_timer.Reset();
+
+  g_gpu_backend->RestoreGraphicsAPIState();
+
+  if (!g_settings.cpu_thread)
+  {
+    CPU::g_state.frame_done = false;
+    ExecuteCPUFrame();
+  }
+  else
+  {
+    WakeCPUThread();
+    g_gpu_backend->RunGPUFrame();
+  }
+
+  g_gpu_backend->ResetGraphicsAPIState();
+}
+
+void FrameDone()
+{
+  s_frame_number++;
+  CPU::g_state.frame_done = true;
+  g_gpu_backend->CPUFrameDone();
 }
 
 void SetThrottleFrequency(float frequency)
@@ -1161,8 +1244,15 @@ void Throttle()
   s_last_throttle_time += s_throttle_period;
 }
 
-void UpdatePerformanceCounters()
+void EndFrame()
 {
+  if (g_settings.cpu_thread)
+  {
+    // finish up anything the CPU pushed to the GPU after vblank
+    WaitForCPUThread();
+    g_gpu_backend->EndGPUFrame();
+  }
+
   const float frame_time = static_cast<float>(s_frame_timer.GetTimeMilliseconds());
   s_average_frame_time_accumulator += frame_time;
   s_worst_frame_time_accumulator = std::max(s_worst_frame_time_accumulator, frame_time);
@@ -1177,8 +1267,12 @@ void UpdatePerformanceCounters()
 
   s_worst_frame_time = s_worst_frame_time_accumulator;
   s_worst_frame_time_accumulator = 0.0f;
+  s_worst_cpu_frame_time = s_worst_cpu_frame_time_accumulator;
+  s_worst_cpu_frame_time_accumulator = 0.0f;
   s_average_frame_time = s_average_frame_time_accumulator / frames_presented;
   s_average_frame_time_accumulator = 0.0f;
+  s_average_cpu_frame_time = s_average_cpu_frame_time_accumulator / frames_presented;
+  s_average_cpu_frame_time_accumulator = 0.0f;
   s_vps = static_cast<float>(frames_presented / time);
   s_last_frame_number = s_frame_number;
   s_fps = static_cast<float>(s_internal_frame_number - s_last_internal_frame_number) / time;
@@ -1188,6 +1282,11 @@ void UpdatePerformanceCounters()
             100.0f;
   s_last_global_tick_counter = global_tick_counter;
   s_fps_timer.Reset();
+
+#ifndef WIN32
+  Log_InfoPrintf("FPS: %.2f VPS: %.2f Average: %.2fms (%.2fms CPU) Worst: %.2fms (%.2fms CPU)", s_fps, s_vps,
+                 s_average_frame_time, s_average_cpu_frame_time, s_worst_frame_time, s_worst_cpu_frame_time);
+#endif
 
   g_host_interface->OnSystemPerformanceCountersUpdated();
 }

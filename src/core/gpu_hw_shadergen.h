@@ -14,13 +14,13 @@ public:
   static bool UseGLSLBindingLayout();
 
   std::string GenerateBatchVertexShader(bool textured);
-  std::string GenerateBatchFragmentShader(GPU_HW::BatchRenderMode transparency, GPU::TextureMode texture_mode,
+  std::string GenerateBatchFragmentShader(GPU_HW::BatchRenderMode transparency, GPUTextureMode texture_mode,
                                           bool dithering, bool interlacing);
   std::string GenerateScreenQuadVertexShader();
   std::string GenerateFillFragmentShader();
   std::string GenerateInterlacedFillFragmentShader();
   std::string GenerateCopyFragmentShader();
-  std::string GenerateDisplayFragmentShader(bool depth_24bit, GPU_HW::InterlacedRenderMode interlace_mode);
+  std::string GenerateDisplayFragmentShader(bool depth_24bit, GPUInterlacedDisplayMode interlace_mode);
   std::string GenerateVRAMReadFragmentShader();
   std::string GenerateVRAMWriteFragmentShader(bool use_ssbo);
   std::string GenerateVRAMCopyFragmentShader();

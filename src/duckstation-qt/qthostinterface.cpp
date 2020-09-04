@@ -7,6 +7,7 @@
 #include "common/string_util.h"
 #include "core/controller.h"
 #include "core/gpu.h"
+#include "core/gpu_backend.h"
 #include "core/system.h"
 #include "frontend-common/game_list.h"
 #include "frontend-common/imgui_styles.h"
@@ -435,7 +436,7 @@ void QtHostInterface::onHostDisplayWindowResized(int width, int height)
   // re-render the display, since otherwise it will be out of date and stretched if paused
   if (!System::IsShutdown())
   {
-    g_gpu->UpdateResolutionScale();
+    g_gpu_backend->UpdateResolutionScale();
     renderDisplay();
   }
 }
@@ -553,7 +554,7 @@ void QtHostInterface::updateDisplayState()
 
   if (!System::IsShutdown())
   {
-    g_gpu->UpdateResolutionScale();
+    g_gpu_backend->UpdateResolutionScale();
     redrawDisplayWindow();
   }
   UpdateSpeedLimiterState();
@@ -1158,7 +1159,7 @@ void QtHostInterface::threadEntryPoint()
 
     renderDisplay();
 
-    System::UpdatePerformanceCounters();
+    System::EndFrame();
 
     if (m_speed_limiter_enabled)
       System::Throttle();

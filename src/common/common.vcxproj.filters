@@ -102,6 +102,8 @@
     <ClInclude Include="minizip_helpers.h" />
     <ClInclude Include="win32_progress_callback.h" />
     <ClInclude Include="make_array.h" />
+    <ClInclude Include="memory_arena.h" />
+    <ClInclude Include="page_fault_handler.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="jit_code_buffer.cpp" />
@@ -196,6 +198,8 @@
     <ClCompile Include="cd_image_memory.cpp" />
     <ClCompile Include="minizip_helpers.cpp" />
     <ClCompile Include="win32_progress_callback.cpp" />
+    <ClCompile Include="memory_arena.cpp" />
+    <ClCompile Include="page_fault_handler.cpp" />
   </ItemGroup>
   <ItemGroup>
     <Natvis Include="bitfield.natvis" />
